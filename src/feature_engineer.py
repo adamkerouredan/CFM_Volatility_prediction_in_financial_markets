@@ -228,3 +228,121 @@ class FeatureEngineer:
             col for col in self.x_train.columns
             if col.startswith(prefix)
         ]
+
+
+class FeatureTransformer:
+    """
+    Génère des transformations cross-sectionnelles et historiques
+    des features brutes selon Paleologo (2024), Chap. 6 — Loadings
+    Generation.
+
+    Pour chaque feature de base, construit :
+    - Z-score cross-sectionnel par date (median + MAD, robuste outliers)
+    - Z-score historique par stock (mean/std fittés sur train)
+
+    Discipline anti-leakage :
+    - Les Z-scores par date n'utilisent JAMAIS la target → autorisés
+      sur tout l'échantillon (train + test).
+    - Les Z-scores par stock utilisent uniquement les statistiques
+      calculées sur le train (fit_stock_stats).
+    """
+
+    def __init__(self, feature_cols: list) -> None:
+        self.feature_cols   = feature_cols
+        self.stock_stats_   = {}   # {col: DataFrame avec mean/std par stock}
+        self._is_fitted     = False
+
+    def fit_stock_stats(
+        self,
+        features_train: pd.DataFrame,
+        meta_train: pd.DataFrame,
+    ) -> "FeatureTransformer":
+        """
+        Calcule mean et std de chaque feature par stock,
+        uniquement sur le train.
+        """
+        df = features_train[self.feature_cols].copy()
+        df["product_id"] = meta_train["product_id"].values
+
+        for col in self.feature_cols:
+            stats = df.groupby("product_id")[col].agg(["mean", "std"])
+            stats["std"] = stats["std"].replace(0, 1e-8)  # éviter div par 0
+            self.stock_stats_[col] = stats
+
+        self._is_fitted = True
+        return self
+
+    def transform_zscore_date(
+        self,
+        features: pd.DataFrame,
+        meta: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Z-score cross-sectionnel par date.
+        Utilise median + MAD pour robustesse aux outliers.
+        Aucune fuite TARGET → utilisable sur tout l'échantillon.
+        """
+        df = features[self.feature_cols].copy()
+        df["date"] = meta["date"].values
+
+        result = pd.DataFrame(index=features.index)
+        for col in self.feature_cols:
+            grouped = df.groupby("date")[col]
+            median  = grouped.transform("median")
+            mad     = grouped.transform(
+                lambda x: np.median(np.abs(x - x.median()))
+            )
+            # 1.4826 = facteur pour rendre MAD comparable à std gaussien
+            result[f"{col}_zd"] = (df[col] - median) / (1.4826 * mad + 1e-8)
+
+        return result
+
+    def transform_zscore_stock(
+        self,
+        features: pd.DataFrame,
+        meta: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Z-score historique par stock.
+        Utilise les statistiques fittées sur le train uniquement.
+        """
+        if not self._is_fitted:
+            raise RuntimeError(
+                "FeatureTransformer doit être fitté avec "
+                "fit_stock_stats() avant transform_zscore_stock()."
+            )
+
+        df = features[self.feature_cols].copy()
+        df["product_id"] = meta["product_id"].values
+
+        result = pd.DataFrame(index=features.index)
+        for col in self.feature_cols:
+            stats         = self.stock_stats_[col]
+            mean_by_stock = df["product_id"].map(stats["mean"])
+            std_by_stock  = df["product_id"].map(stats["std"])
+            # Fallback : stocks jamais vus en train (rare mais possible)
+            mean_by_stock = mean_by_stock.fillna(df[col].mean())
+            std_by_stock  = std_by_stock.fillna(df[col].std()).replace(0, 1e-8)
+
+            result[f"{col}_zs"] = (df[col] - mean_by_stock) / std_by_stock
+
+        return result
+
+    def build_full_matrix(
+        self,
+        features: pd.DataFrame,
+        meta: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Construit la matrice complète : brut + Z-date + Z-stock.
+        """
+        f_zd = self.transform_zscore_date(features, meta)
+        f_zs = self.transform_zscore_stock(features, meta)
+
+        result = pd.concat([
+            features[self.feature_cols].reset_index(drop=True),
+            f_zd.reset_index(drop=True),
+            f_zs.reset_index(drop=True),
+        ], axis=1)
+
+        return result

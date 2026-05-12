@@ -1,5 +1,31 @@
+# Data files (provided by CFM, not for redistribution)
 data/
+*.csv
+
+# Outputs and generated files
 outputs/
-src/__pycache__/
+*.png
+*.pdf
+!reports/*.pdf
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Environment
+.env
+venv/
+env/
+.venv/
