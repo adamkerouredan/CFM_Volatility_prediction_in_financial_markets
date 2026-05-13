@@ -1,298 +1,365 @@
 # Research Protocol — CFM Volatility Forecasting Challenge
 
-**Objective.** Predict the realized volatility of 318 US stocks over the 2pm–4pm window,
-using only intraday data observed between 9:30am and 1:55pm.
+**Objective.** Predict the realized volatility of US equities over the 14:00–16:00 window using only intraday data observed between 09:30 and 13:55.
+
 **Metric.** Mean Absolute Percentage Error (MAPE). Lower is better.
-**Methodological reference.** G. Paleologo, *The Elements of Quantitative Investing*, Wiley 2024.
+
+**Methodological reference.** Giuseppe Paleologo, *The Elements of Quantitative Investing*, Wiley 2024.
 
 ---
 
-## 1. Understanding the problem
+## 1. Problem understanding
 
-The dataset contains 636,313 observations across 318 stocks and 2,117 trading dates.
-For each observation, we have 54 five-minute volatility bars (9:30am to 1:55pm),
-54 return direction bars (sign of price change, values in {-1, 0, +1}), and a
-target variable: the realized volatility of the same stock over the 2pm–4pm window.
+The dataset contains **636,313** training observations across **318** stocks and **2,117** anonymized dates. For each observation, we observe:
 
-Two structural constraints shaped every subsequent decision.
+- 54 five-minute volatility bars from 09:30 to 13:55;
+- 54 return-direction bars over the same window;
+- one target variable: realized volatility of the same stock from 14:00 to 16:00.
 
-**Dates are anonymized.** The challenge deliberately randomizes the order of trading
-days. This eliminates any approach that relies on inter-day chronological structure:
-walk-forward validation in the calendar sense, GARCH-type inter-day models, and
-HAR-RV with true multi-day lags are not directly applicable.
+Two constraints drive the research design.
 
-**Volatility is highly persistent.** The Pearson correlation between the morning
-mean volatility and the afternoon target is 0.857. This means a naive predictor —
-"the afternoon will look like the morning" — already explains 73% of the variance.
-Any model we build must beat this baseline by a meaningful margin to justify its
-complexity.
+### 1.1 Dates are anonymized
+
+The challenge anonymizes and randomizes trading dates. This makes true chronological modeling impossible: calendar walk-forward validation, inter-day GARCH, macro regime features, and true multi-day HAR lags are not directly available.
+
+The validation framework therefore uses stratified holdout, repeated stratified cross-validation, date-grouped bootstrap, and anonymized date-block stability checks.
+
+### 1.2 Volatility persistence is strong
+
+The correlation between morning volatility and afternoon realized volatility is approximately **0.857**. This makes naive volatility persistence a strong benchmark.
+
+A model is only useful if it beats simple baselines by a meaningful and robust margin.
 
 ---
 
 ## 2. Target transformation
 
-The target distribution is highly right-skewed: skewness 5.01, kurtosis 59.9,
-minimum value 0.000132. Training a model directly on the raw target would produce
-heteroscedastic residuals and poor generalization.
+The target is strongly right-skewed, with skewness around **5.01** and kurtosis around **59.9**.
 
-**Decision: log-transform the target** before modeling, following Harvey and
-Shephard (1996). All models are trained on log(TARGET). Predictions are converted
-back via exp() at inference time, with a Jensen correction to account for the
-bias introduced by the non-linear transformation.
+**Decision.** Train models on `log(TARGET)`.
+
+**Rationale.**
+
+- Raw volatility is positive and highly skewed.
+- Log-space stabilizes residuals.
+- Volatility models are naturally multiplicative.
+- Jensen correction can be applied when converting predictions back to raw space.
+
+**Risk.** Log-space training can create shrinkage in high-volatility regimes. This is later audited via underestimation-by-decile and QLIKE.
 
 ---
 
-## 3. Handling missing values
+## 3. Missing values
 
-15.7% of rows contain at least one NaN. The NaNs are heavily concentrated on
-the 9:30am bar (28,091 cases), reflecting a well-known microstructure phenomenon:
-the opening auction produces noisy or missing prices in the first five-minute window.
+15.7% of rows contain at least one missing value, with missingness concentrated near the market open.
 
-**For volatility bars:** linear interpolation along the intraday axis, with
-forward-fill and backward-fill for edge bars. This preserves the continuity
-of the intraday profile without introducing cross-row dependencies.
+### 3.1 Volatility bars
 
-**For return direction bars:** imputation by zero, interpreted as the absence
-of price movement. Economically neutral and avoids inventing directional
-information that was not observed.
+**Decision.** Linear interpolation along the intraday axis, followed by forward-fill and backward-fill.
 
-Two alternatives were rejected. Imputing by cross-sectional mean would introduce
-dependencies between stocks, creating a leakage risk. Dropping rows with NaNs
-would remove 15.7% of the data and introduce selection bias on market open behavior.
+**Rationale.** Missing volatility bars are an intraday continuity issue, not a cross-sectional information problem. Interpolation preserves the shape of each stock-day path without borrowing information from other stocks.
+
+### 3.2 Return-direction bars
+
+**Decision.** Fill missing return-direction values with zero.
+
+**Rationale.** Zero is interpreted as absence of observed directional movement. It avoids creating artificial directionality.
+
+### 3.3 Alternatives rejected
+
+| Alternative | Reason rejected |
+|---|---|
+| Row deletion | Would remove 15.7% of rows and bias the sample toward cleaner market-open days |
+| Cross-sectional mean imputation | Would introduce dependencies across stocks |
+| Random imputation | Not economically interpretable |
 
 ---
 
 ## 4. Feature engineering
 
-Rather than feeding raw bars directly into a model, we constructed 10 features
-from the 54 volatility bars and 54 return bars. Each feature was designed to
-capture a specific economic dimension of the intraday profile.
+The initial raw input contains 108 intraday columns. Instead of using raw bars only, the project builds interpretable features that summarize economically meaningful aspects of the morning volatility path.
 
-### 4.1 Features retained
+### 4.1 Retained raw features
 
 | Feature | Economic hypothesis |
 |---|---|
-| `vol_mean` | Volatility clustering: the morning average predicts the afternoon level |
-| `vol_mean_recent` | The most recent bars (closest to 2pm) best reflect the current regime |
-| `vol_last_bar` | The last observed bar is the most direct signal of current volatility |
-| `vol_linear_slope` | The direction of the intraday trend contains predictive information |
-| `vol_std` | High standard deviation signals an erratic, hard-to-predict day |
-| `vol_min` | The morning floor anchors the overall volatility range |
-| `vol_mean_minus_median` | The mean-median gap measures the presence of isolated spikes |
-| `vol_recent_over_mean` | A ratio above 1 signals volatility accelerating toward 2pm |
-| `return_n_positive` | Directional bias in returns is weakly correlated with volatility level |
-| `return_n_negative` | Same rationale |
+| `vol_mean` | Morning volatility level is persistent into the afternoon |
+| `vol_mean_recent` | Recent bars are closer to the forecast window |
+| `vol_last_bar` | Last observed state is a direct regime proxy |
+| `vol_linear_slope` | Intraday compression or acceleration matters |
+| `vol_std` | Volatility-of-volatility signals unstable regimes |
+| `vol_min` | The observed volatility floor anchors the day |
+| `vol_mean_minus_median` | Mean-median gap captures isolated spikes |
+| `vol_recent_over_mean` | Ratio above 1 indicates acceleration toward 14:00 |
+| `return_n_positive` | Positive directional activity can proxy market activity |
+| `return_n_negative` | Negative directional activity can proxy market stress |
 
 ### 4.2 Features dropped after audit
 
-Six features were initially built and removed after a formal multicollinearity
-audit using Spearman correlation and Information Coefficient analysis.
-
 | Feature dropped | Reason |
 |---|---|
-| `vol_median` | Pearson r = 0.969 with `vol_mean` — no additional information |
-| `vol_trend` | Pearson r = 0.918 with `vol_linear_slope` — redundant |
-| `vol_max` | Spearman r = 0.956 with `vol_std` — redundant |
-| `vol_range` | Spearman r = 0.999 with `vol_max` — near-perfect collinearity |
-| `return_direction_bias` | IC = -0.048 — no predictive signal |
-| `return_last_bar` | IC = +0.002 — no predictive signal |
+| `vol_median` | Redundant with `vol_mean` |
+| `vol_trend` | Redundant with `vol_linear_slope` |
+| `vol_max` | Redundant with `vol_std` |
+| `vol_range` | Redundant with `vol_max` |
+| `return_direction_bias` | Weak IC |
+| `return_last_bar` | Near-zero IC |
+
+The retained design favors a compact feature set with direct economic meaning.
 
 ---
 
 ## 5. Feature evaluation
 
-Before modeling, the 10 retained features were evaluated across three orthogonal
-metrics.
+Three diagnostics are used before modeling.
 
-**Information Coefficient (IC):** Pearson, Kendall τ, and cross-sectional Spearman
-correlations computed between each feature and the log-target. All t-statistics
-exceeded 35 across 2,117 dates — statistically robust signals.
+### 5.1 Information Coefficient
 
-**Marchenko-Pastur analysis:** The eigenvalue spectrum of the feature covariance
-matrix was compared against the noise threshold (λ₊ = 1.0087). Three components
-lie above the threshold (PC1 = 6.37, PC2 = 1.79, PC3 = 1.20), confirming that the
-feature matrix contains genuine structure beyond random noise.
+The strongest features are volatility-level and volatility-shape variables. `vol_mean`, `vol_mean_recent`, and `vol_std` dominate, which is consistent with volatility clustering and intraday persistence.
 
-**Cross-sectional neutralization:** Removing the market-wide component from both
-features and target caused the average IC to drop by approximately 13%. This means
-roughly 87% of the predictive signal is idiosyncratic — stock-specific dynamics,
-not a market beta proxy.
+### 5.2 Marchenko-Pastur analysis
+
+The covariance eigenvalue spectrum shows three components above the random-matrix noise threshold:
+
+| Component | Eigenvalue | Interpretation |
+|---|---:|---|
+| PC1 | 4.7474 | Signal |
+| PC2 | 1.6811 | Signal |
+| PC3 | 1.1637 | Signal |
+| PC4+ | below λ+ ≈ 1.0079 | Noise-dominated |
+
+**Decision.** PCA is useful as a diagnostic of low-dimensional structure, but PCA-based Ridge is not retained because it underperforms. The compression discards information useful for prediction.
+
+### 5.3 Cross-sectional neutralization
+
+After cross-sectional neutralization, the average IC drops by roughly **20–22%**. This means that part of the signal is market-wide, but a substantial idiosyncratic component remains.
+
+**Interpretation.** The model is not merely predicting market beta. Stock-specific morning volatility dynamics still contain useful signal.
 
 ---
 
 ## 6. Feature structuring
 
-Following Paleologo (2024), Chapter 6, each raw feature was extended into two
-additional transformations, for a final matrix of 30 features.
+The final representation expands the 10 raw features into 30 structured features.
 
-**Raw features (10):** the absolute values computed in Section 4.
+| Family | Number | Question answered |
+|---|---:|---|
+| Raw features | 10 | What is the absolute volatility state? |
+| Z-date | 10 | Is this stock unusually volatile relative to other stocks today? |
+| Z-stock | 10 | Is this stock unusually volatile relative to its own history? |
 
-**Cross-sectional Z-scores by date (10):** for each feature and each trading day,
-standardize across all stocks observed on that day, using median and MAD (scaled
-by 1.4826). This answers: *is this stock more volatile than the market today?*
-These Z-scores do not use the target and can be computed on the test set without
-leakage.
+### 6.1 Z-date
 
-**Historical Z-scores by stock (10):** for each feature and each stock, standardize
-using that stock's mean and standard deviation computed on the training set only.
-This answers: *is this stock more volatile than its own history?* Statistics are
-fitted on the training set and applied identically to the test set.
+Computed cross-sectionally by anonymized date using robust median and MAD.
+
+**Leakage status.** No target is used. Test-set Z-date features can be computed because all same-date stock observations are available at prediction time in the challenge setting.
+
+### 6.2 Z-stock
+
+Computed using stock-level training statistics and then applied to holdout/test.
+
+**Leakage status.** Training statistics only. No validation or test labels are used.
 
 ---
 
-## 7. Modeling
+## 7. Modeling decisions
 
-Eight models or configurations were tested, moving from simple to complex.
-Each step was justified by a specific gap in the previous model's performance.
+The modeling path deliberately moves from simple to complex.
 
 ### 7.1 Baselines
 
-**Baseline 1 — Mean of 54 bars** (MAPE CV = 0.3713, holdout = 0.3686).
-The official CFM benchmark. Every model must beat this.
+**Baseline 1 — Mean of 54 bars.**  
+MAPE CV = 0.3713, holdout = 0.3686. This is the main official-style persistence benchmark.
 
-**Baseline 4 — Mean of the last hour** (holdout = 0.2921).
-Using only recent bars already improves substantially, confirming the recency
-effect observed in the IC analysis.
+**Baseline 4 — Mean of last hour.**  
+Holdout = 0.2921. This is a very strong naive benchmark. It confirms that recency matters: volatility close to 14:00 is more informative than the whole morning average.
 
 ### 7.2 Linear models
 
-**Ridge A — 10 engineered features** (MAPE CV = 0.3090).
-Regularized linear regression on the engineered features. The linear reference.
+**Ridge A — 10 engineered features.**  
+CV MAPE = 0.3090, holdout = 0.3085. It beats Baseline 1 but not Baseline 4 on holdout. The linear model is useful as an interpretable reference, not as champion.
 
-**Ridge B — PCA on 3 components** (MAPE CV = 0.3365). Compressing the feature
-matrix to 3 PCA components lost 24% of explained variance and degraded performance.
-**Rejected:** compression discards genuine signal.
+**Ridge B — PCA 3 components.**  
+CV MAPE = 0.3365. Rejected: PCA compression removes predictive signal even though Marchenko-Pastur shows real structure.
 
-### 7.3 Academic baseline
+### 7.3 Academic volatility benchmark
 
-**HAR-RV (Corsi 2009) — 3 intraday horizons** (MAPE CV = 0.2732). The
-Heterogeneous Autoregressive model, implemented with intraday lags (last bar,
-last 6 bars, all 54 bars) as a substitute for the unavailable inter-day lags.
-Provides an academically grounded benchmark.
+**HAR-RV — 3 intraday horizons.**  
+CV MAPE = 0.2732, holdout = 0.2728. It provides a strong economically grounded reference.
+
+Since true inter-day lags are unavailable, HAR-RV is implemented with intraday horizons: recent, medium, and full-morning volatility.
 
 ### 7.4 Non-linear models
 
-**LightGBM C — 10 engineered features** (MAPE CV = 0.2600). The jump from
-Ridge A (0.3090) confirms genuine non-linearities in the feature-target relationship
-that a linear model cannot capture.
+**LightGBM C — 10 engineered features.**  
+CV MAPE = 0.2600. The gain over Ridge A confirms non-linearities in the feature-target relation.
 
-**LightGBM D — 108 raw bars** (MAPE CV = 0.2584, holdout = 0.2569). Feeding all
-54 volatility and 54 return bars directly to LightGBM. LightGBM handles NaNs
-natively, so no imputation is needed. The marginal gain over LightGBM C is small,
-suggesting the 10 engineered features capture most of the information in the 108 raw
-bars in a much more compact form.
+**LightGBM D — 108 raw bars.**  
+CV MAPE = 0.2584, holdout = 0.2581. This is a strong raw-data benchmark. It confirms that raw bars contain signal, but not enough to beat the structured representation.
 
-**LightGBM E — 10 features + product_id** (MAPE CV = 0.2574). Adding the stock
-identifier as a categorical feature. Negligible gain: LightGBM was already learning
-stock-level behavior implicitly through the historical Z-score features.
+**LightGBM E — product identifier added.**  
+CV MAPE = 0.2574. The gain is marginal. Product identity alone is not enough to justify making the model less clean.
 
-**Stacking HAR-RV + LightGBM** (MAPE CV = 0.2614). A meta-learner trained on
-both models' predictions. Performed worse than LightGBM alone because both models
-draw from the same underlying information source. Correlated errors make
-ensembling ineffective. **Rejected.**
+**Stacking HAR-RV + LightGBM.**  
+CV MAPE = 0.2614. Rejected because the errors are likely correlated; both models exploit the same volatility persistence source.
 
-**LightGBM F — 30 structured features** (MAPE CV = 0.2427, holdout = 0.2392).
-The champion model. Adding the 20 Z-score features reduced MAPE by 6.7% relative
-to LightGBM C. The cross-sectional and historical Z-scores encode information that
-LightGBM was previously forced to infer implicitly — making it explicit and structured
-improves both accuracy and stability.
+**LightGBM F — 30 structured features.**  
+CV MAPE = **0.2427**, official holdout MAPE = **0.2398**. Retained as champion.
+
+### 7.5 Post-holdout diagnostic
+
+A diagnostic run with `n_estimators=3000` achieved MAPE = **0.2392**.
+
+**Decision.** Not retained as official champion because it was tested after observing holdout performance. The retained model remains LightGBM F with `n_estimators=2000`.
 
 ---
 
-## 8. Directions not explored
+## 8. Validation protocol
 
-**Sequential models (LSTM, TCN, Transformer).** Expected gain: 1-2 MAPE points.
-Excluded: significant loss of interpretability, and the project prioritized
-methodological clarity over leaderboard ranking.
+### 8.1 Holdout
 
-**GARCH and inter-day time series models.** Would require chronological order.
-Excluded: dates are anonymized.
+A 15% holdout set is created and kept untouched until final evaluation.
 
-**MAPE-aware loss function** (sample_weight = 1/y²). Implemented and tested.
-Global MAPE improved by ~2 points, but Q4 performance (highest-volatility quartile)
-degraded from 0.21 to 0.30. **Rejected:** a risk-oriented model must perform well
-precisely on high-volatility days.
+### 8.2 Cross-validation
 
-**External data (VIX, market indices).** Expected gain: 1-2 points. Excluded by
-methodological choice: project uses only challenge-provided data.
+Repeated Stratified K-Fold with 5 folds × 2 repetitions, stratified by TARGET quartile.
+
+### 8.3 Early stopping
+
+LightGBM early stopping uses an internal validation split carved from the training fold, never the external validation fold or holdout.
+
+### 8.4 Bootstrap
+
+Uncertainty is measured by **date-grouped bootstrap**, not row-by-row bootstrap. This respects intra-date dependence across stocks.
+
+### 8.5 QLIKE
+
+QLIKE is used as an auxiliary volatility-forecasting loss. It penalizes poorly calibrated variance forecasts, especially underprediction.
 
 ---
 
-## 9. Validation protocol
-
-### 9.1 Data split
-
-A 15% holdout set was created before any modeling, stratified by TARGET quartile.
-It was not touched until the final evaluation of the single champion model. No
-hyperparameter tuning or model selection used holdout data.
-
-### 9.2 Cross-validation
-
-Repeated Stratified K-Fold (5 folds × 2 repetitions), stratified by TARGET quartile.
-For LightGBM, early stopping used a dedicated internal validation split carved from
-the training fold — never the external test fold.
-
-### 9.3 Final evaluation
+## 9. Final evaluation
 
 | Metric | Value |
-|---|---|
-| MAPE (holdout) | 0.2392 |
-| QLIKE (Patton-Sheppard 2009) | 0.1928 |
-| 95% bootstrap CI (grouped by date) | [0.2352, 0.2451] |
-| R² | 0.78 |
+|---|---:|
 | CV MAPE | 0.2427 |
+| Holdout MAPE | 0.2398 |
+| Date-grouped bootstrap 95% CI | [0.2352, 0.2451] |
+| QLIKE holdout | 0.1941 |
+| R² holdout | 0.7986 |
+| Public leaderboard MAPE | 24.25 |
+| Public rank | 8 / 17 |
 
-The CV and holdout MAPEs are consistent and within the bootstrap CI. No overfitting detected.
-
-**Performance by volatility regime:**
-
-| Quartile | TARGET range | MAPE | Note |
-|---|---|---|---|
-| Q1 (calm) | < 0.10 | 0.3573 | MAPE artifact on small denominators |
-| Q2 | 0.10–0.14 | 0.2017 | Strong |
-| Q3 | 0.14–0.21 | 0.1897 | Best absolute performance |
-| Q4 (volatile) | > 0.21 | 0.2083 | Strong — the regime that matters for risk |
-| Top 10% | > 0.33 | 0.2195 | Better than global average |
-
-The model performs better in high-volatility regimes than on average — the correct
-property for a risk management application.
+The CV and holdout results are consistent. The public score is close to the internal validation level.
 
 ---
 
-## 10. Known limitations
+## 10. Robustness results
 
-**Systematic underestimation in high-volatility regimes.** The model underestimates
-66% of observations in the highest decile. This is a known shrinkage artifact of
-ML models trained with MSE loss in log-space. In production, this would require
-correction via multiplicative recalibration by decile or asymmetric loss functions.
+### 10.1 Apples-to-apples holdout table
 
-**Degradation at extreme tails.** MAPE reaches 29.7% at the top 0.1% of the target
-distribution. An Extreme Value Theory overlay could improve this behavior.
+LightGBM F dominates all relevant benchmarks on the same holdout set:
 
-**MAPE dominated by quiet days.** The 24% global MAPE is driven upward by Q1
-(35.7%), while Q2-Q4 perform at approximately 20%. This is a property of the
-metric, not of the model.
+| Model | MAPE holdout |
+|---|---:|
+| LightGBM F — 30 structured features | 0.2398 |
+| LightGBM D — raw bars | 0.2581 |
+| HAR-RV | 0.2728 |
+| Baseline 4 | 0.2921 |
+| Ridge A | 0.3085 |
+| Baseline 1 | 0.3686 |
+
+### 10.2 Ablation
+
+| Representation | MAPE holdout | Interpretation |
+|---|---:|---|
+| Raw only | 0.2569 | Strong, but incomplete |
+| Raw + Z-date | 0.2420 | Main incremental gain |
+| Raw + Z-stock | 0.2532 | Positive but smaller |
+| Full F | 0.2398 | Best representation |
+
+**Decision.** Keep the full 30-feature representation. The ablation shows that Z-date is the main driver of the improvement.
+
+### 10.3 Volatility regimes
+
+LightGBM F underperforms Baseline 4 in D1 and is roughly neutral in D2. From D3 to D10, it delivers strong positive gains.
+
+**Interpretation.** The model is most valuable in economically meaningful volatility regimes. The poorest relative behavior occurs where MAPE is least stable: tiny targets.
+
+### 10.4 Date-block robustness
+
+LightGBM F beats Baseline 4 in every anonymized date block, with gains around 16%–21%.
+
+**Interpretation.** The result is not concentrated in one holdout segment.
+
+### 10.5 Candidate features
+
+Candidate economic features improve CV MAPE from 0.2427 to 0.2421.
+
+**Decision.** Not retained. The improvement is too small relative to CV noise and would require additional out-of-sample confirmation.
+
+### 10.6 Regularized LightGBM
+
+A more regularized LightGBM obtains CV MAPE 0.2438.
+
+**Decision.** Not retained. The result is close enough to confirm robustness, but not better than the official champion.
 
 ---
 
-## 11. Summary
+## 11. Known limitations
 
-| Decision point | Choice made | Rejected alternatives |
+### 11.1 Quiet-day MAPE instability
+
+D1-D2 are problematic because MAPE over-penalizes small denominators. This is a metric limitation, not necessarily a large economic error.
+
+### 11.2 Extreme-tail degradation
+
+Performance deteriorates in the top 0.5% and top 0.1% of the target distribution. A production-grade risk model would need tail-specific calibration.
+
+### 11.3 Underestimation in high-volatility regimes
+
+Underestimation frequency rises with target decile. This is consistent with shrinkage in log-space ML models.
+
+### 11.4 No real chronological walk-forward
+
+Because dates are anonymized, the project cannot verify robustness across real market regimes such as crisis, rebound, or low-volatility periods.
+
+---
+
+## 12. Rejected alternatives
+
+| Alternative | Status | Reason |
 |---|---|---|
-| Target | Log-transform | Raw level |
-| NaN volatility | Intraday interpolation | Cross-sectional mean, row deletion |
-| NaN returns | Fill with zero | Interpolation |
-| Features | 10 hand-crafted | Raw bars only |
-| Feature structuring | Raw + Z-date + Z-stock (30 total) | Raw only, PCA compression |
-| Linear model | Ridge on raw features | Ridge on PCA |
-| Non-linear model | LightGBM on 30 structured features | LSTM, stacking |
-| Loss function | MSE in log-space | MAPE-aware weighting |
-| Validation | Repeated Stratified K-Fold + stratified holdout | Standard K-Fold |
-
-**Final result: MAPE = 24.25 on the public leaderboard — rank 8 / 17.**
-CFM official benchmark: 68.14. Improvement factor: 2.8×.
+| Raw target modeling | Rejected | Target skewness and heteroscedasticity |
+| PCA representation | Rejected | Worse than 10 raw engineered features |
+| Stacking | Rejected | Correlated errors, worse than LightGBM F |
+| Product ID categorical | Rejected as champion | Marginal gain, less clean |
+| MAPE-aware weighting | Rejected | Degraded high-volatility regime behavior |
+| Sequential models | Not explored | Less interpretable, not needed for robust baseline |
+| External data | Not used | Kept challenge-input-only discipline |
+| Candidate features | Not retained | Positive but marginal CV gain |
+| More regularized LightGBM | Not retained | Robust but slightly worse |
 
 ---
 
-*Adam Kerouredan — M2 Quantitative Finance, 2025-2026.*
-*Reference: G. Paleologo, The Elements of Quantitative Investing, Wiley 2024.*
+## 13. Final decision
+
+The final retained model is:
+
+```text
+LightGBM F
+Input: 30 structured features
+Target: log(TARGET)
+n_estimators: 2000
+Validation: repeated stratified CV + untouched 15% holdout
+Submission: outputs/submission.csv
+```
+
+Final internal holdout MAPE: **0.2398**.  
+Public leaderboard score: **24.25**.  
+Public rank: **8 / 17**.
+
+---
+
+*Adam Kerouredan — M2 Quantitative Finance, 2025–2026.*  
+*Reference: Giuseppe Paleologo, The Elements of Quantitative Investing, Wiley 2024.*
